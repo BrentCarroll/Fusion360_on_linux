@@ -21,6 +21,11 @@ Nothing here is specific to a particular machine. The defect is in Wine's X11 dr
 reproduce on any X11 or XWayland session whose window manager honours override-redirect, which
 includes GNOME/Mutter and KDE/KWin.
 
+The window-stacking fix documented below is **necessary but not sufficient**. Several other
+problems have to be solved before Fusion runs at all, and two of them silently produce a
+usable-looking application with a dead 3D viewport. See
+[Other fixes required for a working install](#other-fixes-required-for-a-working-install).
+
 ---
 
 ## Symptom
@@ -507,6 +512,152 @@ main window's. Leave the small override-redirect windows alone — those are leg
 
 Falling back to **File → New Design** (Ctrl+N) instead of the "+" button also avoids the
 code path entirely, since that route does not create the scrim.
+
+---
+
+---
+
+## Other fixes required for a working install
+
+The stacking defect above is the only change to Wine's *source*. It is not the only change
+required. Everything in this section must also be in place, and the two rendering items in
+particular fail in a way that looks like a working installation.
+
+### Wine version
+
+| Wine | Result |
+|---|---|
+| 9.22 | Null-pointer crash inside `qwindows.dll`; no window ever appears |
+| 10.11-staging | Window appears, then aborts on unimplemented `bcp47langs.dll.GetUserLanguages` during sign-in |
+| **11.19-staging** | Reaches sign-in cleanly, no module errors |
+
+Use the **WoW64** build. A plain `-amd64` build exits immediately with
+`/lib/ld-linux.so.2: could not open` on any system without i386 multiarch.
+
+Set the prefix to **Windows 11** mode.
+
+### 3D rendering, part 1: DXVK is mandatory
+
+With Wine's default wined3d (Direct3D → OpenGL) path, the application starts, the UI chrome
+draws correctly, and **the 3D viewport is blank white**. Install DXVK so Direct3D 11 is
+translated to Vulkan instead:
+
+```
+[HKEY_CURRENT_USER\Software\Wine\DllOverrides]
+"d3d11"="native"
+"dxgi"="native"
+"d3d10core"="native"
+"d3d9"="native"
+```
+
+### 3D rendering, part 2: a native `d3dcompiler_47` is also mandatory
+
+DXVK alone is not enough, and this is the most deceptive failure of the whole exercise. With
+DXVK installed and reporting no errors, **sketches and edges draw but solid surfaces never
+rasterise**. Wine's builtin `d3dcompiler_47` cannot compile the application's HLSL shaders at
+runtime.
+
+Objective evidence — pixel statistics of the same 50 mm cube, rendered through the application's
+own API in four visual styles. A single unique colour means nothing was drawn:
+
+| visual style | before | after |
+|---|---|---|
+| Shaded | 1 colour, stdev 0.00 | **199 colours, stdev 72.12** |
+| Shaded + hidden edges | 53 colours, stdev 1.56 | **677 colours, stdev 73.13** |
+| Shaded, visible edges only | 1 colour, stdev 0.00 | 166 colours, stdev 73.04 |
+
+The geometry was correct the whole time — the cube measured exactly 125 cm³ — so this cannot be
+caught by checking that modelling operations succeed. **Only a rendered pixel tells you.** Any
+automated test of a CAD application under Wine should assert on image statistics, not just on
+API return values.
+
+A genuine `d3dcompiler_47.dll` is usually **already inside the prefix**, shipped with the
+WebView2 runtime that the installer pulls in:
+
+```
+drive_c/Program Files (x86)/Microsoft/EdgeWebView/Application/<version>/d3dcompiler_47.dll
+```
+
+Back up the builtin, copy that file into `system32`, and override:
+
+```
+[HKEY_CURRENT_USER\Software\Wine\DllOverrides]
+"d3dcompiler_47"="native,builtin"
+```
+
+### Hiding Wine from the application
+
+By default the application logs `Fusion is running on GNU/Linux using WINE` and takes different
+code paths accordingly. Wine-staging can hide its exports:
+
+```
+[HKEY_CURRENT_USER\Software\Wine]
+"HideWineExports"="Y"
+```
+
+With this set, the application's embedded Python reports `os.name == 'nt'` as it would on
+Windows. This is a **staging-only** feature — another reason to build staging rather than
+vanilla Wine.
+
+### Qt PDF plugin crash (older Wine)
+
+On Wine 9.22 a second crash masks the first. The Qt image-format plugin
+`plugins/imageformats/qpdf.dll` imports:
+
+```
+Qt6Core.dll
+Qt6Gui.dll
+Qt6Pdf.dll      <- never shipped by the vendor
+```
+
+The load fails, returns NULL, and the result is dereferenced. Rename the plugin to
+`qpdf.dll.disabled`. Not required on 11.19, but worth knowing: while it is present it hides
+whatever else is wrong.
+
+### Sign-in returns to the software store instead of the application
+
+Browser-based sign-in completes by invoking an **`adskidmgr://`** URL. The browser runs on
+Linux, the application runs inside Wine, and nothing on the desktop handles that scheme — so
+the desktop offers to search the software store and the login never returns.
+
+Register a handler that passes the URL into the prefix:
+
+1. A small script that runs `AdskIdentityManager.exe` inside the prefix with `"$1"`.
+2. A `.desktop` entry for it containing `MimeType=x-scheme-handler/adskidmgr;`.
+3. `xdg-mime default <entry>.desktop x-scheme-handler/adskidmgr`
+
+Verify with `xdg-mime query default x-scheme-handler/adskidmgr`.
+
+### Sign-in race on restart
+
+Restarting too quickly produces:
+
+```
+IDSDKAuth: idsdk_set_product_config failed with error IDSDK_E_SERVER_PROCESS_NOT_READY
+IDSDKAuth: Showing blocking Quit dialog. title=Unable to sign in
+```
+
+The Identity SDK helper has not finished shutting down. A reliable sequence is: kill the
+application and `AdskIdentityManager`, wait ~8 s, then `wineserver -k`, then wait ~10 s more
+before relaunching.
+
+Do **not** delete `AppData/Local/Autodesk/Web Services` while troubleshooting — it holds the
+authentication token, and removing it forces a full re-login.
+
+### No icon in the taskbar
+
+Two separate causes:
+
+- Pointing `Icon=` at a Windows `.ico` does not resolve. Extract the embedded 256x256 PNG from
+  the application's `.ico` into the hicolor theme and reference it by name.
+- Without `StartupWMClass`, a running window has nothing tying it back to the launcher. Read the
+  real class from a live window with `xprop WM_CLASS` — it is `fusion360.exe` — and set
+  `StartupWMClass=fusion360.exe` in the `.desktop` entry.
+
+### DLL overrides to leave alone
+
+`mfc140u` and `msvcp140` must stay **native**. Wine ships no builtin `mfc140u`, so forcing
+builtin there breaks startup.
 
 ---
 
