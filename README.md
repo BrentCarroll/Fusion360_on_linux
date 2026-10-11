@@ -529,7 +529,7 @@ particular fail in a way that looks like a working installation.
 |---|---|
 | 9.22 | Null-pointer crash inside `qwindows.dll`; no window ever appears |
 | 10.11-staging | Window appears, then aborts on unimplemented `bcp47langs.dll.GetUserLanguages` during sign-in |
-| **11.19-staging** | Reaches sign-in cleanly, no module errors |
+| **11.19-staging** | Reaches sign-in cleanly; the `bcp47langs` abort is gone and module errors drop from dozens to 4 |
 
 Use the **WoW64** build. A plain `-amd64` build exits immediately with
 `/lib/ld-linux.so.2: could not open` on any system without i386 multiarch.
